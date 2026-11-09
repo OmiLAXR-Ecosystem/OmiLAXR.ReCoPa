@@ -35,7 +35,7 @@ Add this to `Packages/manifest.json`:
 ```json
 {
   "dependencies": {
-    "com.rwth.unity.omilaxr.recopa": "0.0.1"
+    "com.rwth.unity.omilaxr.recopa": "0.0.2"
   }
 }
 ```

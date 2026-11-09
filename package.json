@@ -1,6 +1,6 @@
 {
   "name": "com.rwth.unity.omilaxr.recopa",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "displayName": "OmiLAXR.ReCoPa",
   "description": "An OmiLAXR module for managing communication between ReCoPa and OmiLAXR.",
   "unity": "2021.3",

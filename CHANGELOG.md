@@ -18,6 +18,7 @@
 - Reading no longer hangs on runtimes where `NetworkStream.ReadAsync` ignores the cancellation token.
 - `ClientAuth.ToString()` no longer prints the secret.
 - The hello frame no longer throws an `ArgumentNullException` when `SocketClientOptions.SessionId` is set and `ExtraHeaders` is `null`. It sends empty headers instead.
+- `SocketResponse` uses `Newtonsoft.Json.Linq` instead of `Unity.Plastic.Newtonsoft.Json.Linq`. The Plastic copy belongs to the editor-only Version Control package, so player builds and projects without that package failed to compile.
 
 ## [0.0.1] - 2026-02-05
 

@@ -4,7 +4,7 @@
 * This file is part of OmiLAXR.
 */
 using System;
-using Unity.Plastic.Newtonsoft.Json.Linq;
+using Newtonsoft.Json.Linq;
 
 namespace OmiLAXR.ReCoPa.Network
 {

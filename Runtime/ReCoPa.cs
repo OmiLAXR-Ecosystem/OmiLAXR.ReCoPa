@@ -81,7 +81,6 @@ namespace OmiLAXR.ReCoPa
         public xApiDataProvider DataProvider { get; private set; }
 
         private Coroutine _scenarioUpdateCoroutine;
-        private bool _wasTracking;
 
         /// <summary>
         /// Registry for xAPI extensions and activity metadata.
@@ -322,13 +321,11 @@ namespace OmiLAXR.ReCoPa
             
             p.AfterStartedPipeline += (_) =>
             {
-                _wasTracking = true;
                 SendMeta("tracking:start");
             };
             
             p.BeforeStoppedPipeline += (_) =>
             {
-                _wasTracking = false;
                 SendMeta("tracking:stop");
             };
             

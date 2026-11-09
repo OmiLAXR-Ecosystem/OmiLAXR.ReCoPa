@@ -17,6 +17,7 @@
 - When a send fails while flushing the queue, the failed message and all remaining ones go back into the queue in their original order.
 - Reading no longer hangs on runtimes where `NetworkStream.ReadAsync` ignores the cancellation token.
 - `ClientAuth.ToString()` no longer prints the secret.
+- The hello frame no longer throws an `ArgumentNullException` when `SocketClientOptions.SessionId` is set and `ExtraHeaders` is `null`. It sends empty headers instead.
 
 ## [0.0.1] - 2026-02-05
 

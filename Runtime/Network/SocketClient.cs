@@ -344,7 +344,8 @@ namespace OmiLAXR.ReCoPa.Network
                     {
                         var helloObj = new JObject
                         {
-                            ["headers"] = JObject.FromObject(_opt.ExtraHeaders),
+                            // ExtraHeaders may be null when only a session id is set
+                            ["headers"] = _opt.ExtraHeaders != null ? JObject.FromObject(_opt.ExtraHeaders) : new JObject(),
                             ["sessionId"] = _opt.SessionId ?? string.Empty,
                             ["ts"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                         };

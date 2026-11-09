@@ -196,6 +196,25 @@ namespace OmiLAXR.ReCoPa.Tests
         }
 
         [Test]
+        public void SocketClient_Sends_Hello_With_Empty_Headers_When_ExtraHeaders_Is_Null()
+        {
+            // Arrange
+            var client = Connect(Options(o =>
+            {
+                o.SessionId = "session-42";
+                o.ExtraHeaders = null;
+            }), out var server);
+
+            // Act
+            var (ev, payload) = ReadFrame(server);
+
+            // Assert
+            Assert.IsTrue(client.Connected);
+            Assert.AreEqual("hello", ev);
+            Assert.AreEqual(0, ((JObject)JObject.Parse(payload)["headers"]).Count);
+        }
+
+        [Test]
         public void SocketClient_Emit_Without_Buffer_Throws_When_Disconnected()
         {
             // Arrange

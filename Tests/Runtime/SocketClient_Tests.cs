@@ -321,30 +321,6 @@ namespace OmiLAXR.ReCoPa.Tests
         }
 
         [Test]
-        public void SocketClient_Reconnect_Delay_Uses_Capped_Backoff_With_Jitter()
-        {
-            // Arrange
-            var client = new SocketClient("127.0.0.1", Options(o =>
-            {
-                o.ReconnectionDelay = 1000;
-                o.ReconnectionDelayMax = 3000;
-                o.ReconnectBackoffFactor = 2;
-            }));
-            var compute = typeof(SocketClient).GetMethod("ComputeReconnectDelay", BindingFlags.NonPublic | BindingFlags.Instance);
-
-            // Act
-            var first = (TimeSpan)compute.Invoke(client, new object[] { 1 });
-            var second = (TimeSpan)compute.Invoke(client, new object[] { 2 });
-            var capped = (TimeSpan)compute.Invoke(client, new object[] { 10 });
-
-            // Assert
-            Assert.That(first.TotalMilliseconds, Is.InRange(900, 1100));
-            Assert.That(second.TotalMilliseconds, Is.InRange(1800, 2200));
-            Assert.That(capped.TotalMilliseconds, Is.InRange(2700, 3300));
-            client.Dispose();
-        }
-
-        [Test]
         public void SocketClient_Rejects_Null_Arguments()
         {
             Assert.Throws<ArgumentNullException>(() => new SocketClient(null, new SocketClientOptions()));

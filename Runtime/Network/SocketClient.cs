@@ -94,8 +94,10 @@ namespace OmiLAXR.ReCoPa.Network
         private readonly SemaphoreSlim _writeLock = new(1, 1);
         private readonly Dictionary<string, List<Action<SocketResponse>>> _handlers = new(StringComparer.Ordinal);
 
-        private TcpClient? _tcp;
-        private NetworkStream? _stream;
+        private readonly ISocketTransport _transport;
+        private readonly IFrameCodec _codec;
+        private readonly IReconnectPolicy _reconnectPolicy;
+        private Stream? _stream;
 
         private CancellationTokenSource? _cts;
         private Task? _runTask;
@@ -149,7 +151,7 @@ namespace OmiLAXR.ReCoPa.Network
         /// <summary>
         /// True when the underlying TCP client is connected.
         /// </summary>
-        public bool Connected => _tcp?.Connected == true;
+        public bool Connected => _stream != null && _transport.Connected;
 
         /// <summary>
         /// Gets or sets the JSON serializer used for payloads.
@@ -166,9 +168,21 @@ namespace OmiLAXR.ReCoPa.Network
         /// <param name="connectionUrl">Target host:port or URL</param>
         /// <param name="options">Client configuration options</param>
         public SocketClient(string connectionUrl, SocketClientOptions options)
+            : this(connectionUrl, options, null, null, null)
+        {
+        }
+
+        /// <summary>
+        /// Creates a socket client with replaceable transport, wire format and reconnect timing (null = default).
+        /// </summary>
+        public SocketClient(string connectionUrl, SocketClientOptions options,
+            ISocketTransport? transport, IFrameCodec? codec = null, IReconnectPolicy? reconnectPolicy = null)
         {
             _connectionUrl = connectionUrl ?? throw new ArgumentNullException(nameof(connectionUrl));
             _opt = options ?? throw new ArgumentNullException(nameof(options));
+            _transport = transport ?? new TcpSocketTransport(_opt);
+            _codec = codec ?? LengthPrefixedFrameCodec.Instance;
+            _reconnectPolicy = reconnectPolicy ?? new ExponentialBackoffReconnectPolicy(_opt);
 
             _syncContext = (_opt.UseSynchronizationContext ? SynchronizationContext.Current : null);
         }
@@ -405,29 +419,7 @@ namespace OmiLAXR.ReCoPa.Network
         {
             // Ensure any previous socket is closed before reconnect.
             SafeClose();
-
-            // Create and configure the TCP client.
-            var tcp = new TcpClient();
-            ConfigureSocket(tcp);
-
-            // Start connect attempt.
-            var connectTask = tcp.ConnectAsync(host, port);
-
-            // Enforce connection timeout when configured.
-            var timeout = Math.Max(0, _opt.ConnectTimeoutMs);
-            if (timeout > 0)
-            {
-                var timeoutTask = Task.Delay(timeout, ct);
-                var done = await Task.WhenAny(connectTask, timeoutTask).ConfigureAwait(false);
-                if (done == timeoutTask)
-                    throw new TimeoutException($"Connect timeout after {timeout}ms.");
-            }
-
-            // Await completion and capture stream.
-            await connectTask.ConfigureAwait(false);
-
-            _tcp = tcp;
-            _stream = tcp.GetStream();
+            _stream = await _transport.ConnectAsync(host, port, Math.Max(0, _opt.ConnectTimeoutMs), ct).ConfigureAwait(false);
         }
 
         private async Task ReceiveLoopAsync(CancellationToken ct)
@@ -437,7 +429,7 @@ namespace OmiLAXR.ReCoPa.Network
             while (!ct.IsCancellationRequested)
             {
                 // Read next framed message from the TCP stream.
-                var (ev, payload) = await Framing.ReadMessageAsync(
+                var (ev, payload) = await _codec.ReadAsync(
                     _stream,
                     _opt.MaxMessageBytes,
                     TimeSpan.FromMilliseconds(Math.Max(0, _opt.ReceiveTimeoutMs)),
@@ -489,7 +481,7 @@ namespace OmiLAXR.ReCoPa.Network
             try
             {
                 var stream = _stream ?? throw new InvalidOperationException("No stream.");
-                await Framing.WriteMessageAsync(
+                await _codec.WriteAsync(
                     stream,
                     eventName,
                     payload,
@@ -539,64 +531,13 @@ namespace OmiLAXR.ReCoPa.Network
             _syncContext.Post(_ => a(), null);
         }
 
-        private TimeSpan ComputeReconnectDelay(int attempt)
-        {
-            // Compute exponential backoff based on attempt count.
-            var factor = Math.Max(1.0, _opt.ReconnectBackoffFactor);
-            double baseMs = Math.Max(0, _opt.ReconnectionDelay);
-            var maxMs = Math.Max(baseMs, _opt.ReconnectionDelayMax);
-
-            var ms = baseMs * Math.Pow(factor, Math.Max(0, attempt - 1));
-            ms = Math.Min(ms, maxMs);
-
-            // jitter +/- 10%
-            var jitter = ms * 0.1;
-            var r = ThreadSafeRandom.NextDouble();
-            ms = ms + (r * 2.0 - 1.0) * jitter;
-
-            return TimeSpan.FromMilliseconds(Math.Max(0, ms));
-        }
-
-        private void ConfigureSocket(TcpClient tcp)
-        {
-            try
-            {
-                tcp.NoDelay = _opt.NoDelay;
-                
-                if (_opt.KeepAlive)
-                {
-                    tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                    
-                    // OS-Level Keep-Alive Einstellungen (für Verbindungs-Stabilitaet)
-                    try
-                    {
-                        // Linux/macOS: TCP Keep-Alive Tuning
-                        #if !UNITY_EDITOR && !UNITY_STANDALONE_WIN
-                        tcp.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.KeepAliveTime, _opt.TcpKeepAliveIdleSeconds);
-                        tcp.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.KeepAliveInterval, _opt.TcpKeepAliveIntervalSeconds);
-                        tcp.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.KeepAliveProbes, _opt.TcpKeepAliveProbes);
-                        #endif
-                    }
-                    catch 
-                    { 
-                        // Einige Optionen sind ggf. nicht verfügbar - das ist ok
-                    }
-                }
-
-                UnityEngine.Debug.Log($"[ReCoPa] Socket configured - NoDelay: {tcp.NoDelay}, KeepAlive: {_opt.KeepAlive}");
-            }
-            catch (Exception ex) 
-            { 
-                UnityEngine.Debug.LogWarning($"[ReCoPa] Socket configuration warning: {ex.Message}");
-            }
-        }
+        private TimeSpan ComputeReconnectDelay(int attempt) => _reconnectPolicy.GetDelay(attempt);
 
         private void SafeClose()
         {
             try { _stream?.Close(); } catch { }
-            try { _tcp?.Close(); } catch { }
+            try { _transport.Close(); } catch { }
             _stream = null;
-            _tcp = null;
         }
 
         // ============================================================
@@ -704,104 +645,6 @@ namespace OmiLAXR.ReCoPa.Network
                 return (parts[0], p);
 
             return (urlOrHostPort, defaultPort);
-        }
-
-        // ------------------------------------------------------------
-        // Framing: [int32 bodyLen BE][uint16 eventLen BE][event UTF8][payload UTF8]
-        // ------------------------------------------------------------
-        private static class Framing
-        {
-            public static async Task WriteMessageAsync(
-                NetworkStream stream,
-                string eventName,
-                string payload,
-                int maxMessageBytes,
-                TimeSpan sendTimeout,
-                CancellationToken ct)
-            {
-                if (stream == null) throw new ArgumentNullException(nameof(stream));
-                if (eventName == null) throw new ArgumentNullException(nameof(eventName));
-                payload ??= string.Empty;
-
-                var evBytes = Encoding.UTF8.GetBytes(eventName);
-                if (evBytes.Length > ushort.MaxValue)
-                    throw new ArgumentOutOfRangeException(nameof(eventName), "eventName too long.");
-
-                var plBytes = Encoding.UTF8.GetBytes(payload);
-
-                var bodyLen = 2 + evBytes.Length + plBytes.Length;
-                if (bodyLen <= 0 || bodyLen > maxMessageBytes)
-                    throw new InvalidDataException($"Message too large: {bodyLen} > {maxMessageBytes}");
-
-                var frame = new byte[4 + bodyLen];
-                BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(0, 4), bodyLen);
-                BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(4, 2), (ushort)evBytes.Length);
-
-                Buffer.BlockCopy(evBytes, 0, frame, 6, evBytes.Length);
-                Buffer.BlockCopy(plBytes, 0, frame, 6 + evBytes.Length, plBytes.Length);
-
-                using var linked = CreateTimeoutCts(sendTimeout, ct);
-                await stream.WriteAsync(frame, 0, frame.Length, linked.Token).ConfigureAwait(false);
-                await stream.FlushAsync(linked.Token).ConfigureAwait(false);
-            }
-
-            public static async Task<(string EventName, string Payload)> ReadMessageAsync(
-                NetworkStream stream,
-                int maxMessageBytes,
-                TimeSpan receiveTimeout,
-                CancellationToken ct)
-            {
-                var lenBuf = new byte[4];
-                await ReadExactAsync(stream, lenBuf, receiveTimeout, ct).ConfigureAwait(false);
-
-                var bodyLen = BinaryPrimitives.ReadInt32BigEndian(lenBuf.AsSpan());
-                if (bodyLen <= 0 || bodyLen > maxMessageBytes)
-                    throw new InvalidDataException($"Invalid body length {bodyLen} (limit {maxMessageBytes}).");
-
-                var body = new byte[bodyLen];
-                await ReadExactAsync(stream, body, receiveTimeout, ct).ConfigureAwait(false);
-
-                var evLen = BinaryPrimitives.ReadUInt16BigEndian(body.AsSpan(0, 2));
-                if (evLen == 0 || 2 + evLen > bodyLen)
-                    throw new InvalidDataException("Invalid event name length.");
-
-                var ev = Encoding.UTF8.GetString(body, 2, evLen);
-                var payload = Encoding.UTF8.GetString(body, 2 + evLen, bodyLen - (2 + evLen));
-                return (ev, payload);
-            }
-
-            private static async Task ReadExactAsync(NetworkStream stream, byte[] buffer, TimeSpan timeout, CancellationToken ct)
-            {
-                var offset = 0;
-                using var linked = CreateTimeoutCts(timeout, ct);
-                // NetworkStream.ReadAsync may ignore the token on some runtimes; closing the stream unblocks it.
-                using var registration = linked.Token.Register(stream.Close);
-
-                while (offset < buffer.Length)
-                {
-                    var read = await stream.ReadAsync(buffer, offset, buffer.Length - offset, linked.Token).ConfigureAwait(false);
-                    if (read == 0) throw new EndOfStreamException("Remote closed connection.");
-                    offset += read;
-                }
-            }
-
-            private static CancellationTokenSource CreateTimeoutCts(TimeSpan timeout, CancellationToken ct)
-            {
-                var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                if (timeout > TimeSpan.Zero) cts.CancelAfter(timeout);
-                return cts;
-            }
-        }
-
-        private static class ThreadSafeRandom
-        {
-            private static readonly object _lock = new();
-            private static readonly Random _rnd = new();
-
-            public static double NextDouble()
-            {
-                lock (_lock) return _rnd.NextDouble();
-            }
         }
     }
 }

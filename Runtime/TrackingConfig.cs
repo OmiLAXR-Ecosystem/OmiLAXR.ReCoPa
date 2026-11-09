@@ -46,7 +46,8 @@ namespace OmiLAXR.ReCoPa
             /// <returns>Formatted auth description</returns>
             public override string ToString()
             {
-                return $"[ClientAuth: key={key}, secret={secret}]";
+                // Never print the secret, configs are logged
+                return $"[ClientAuth: key={key}, secret={(string.IsNullOrEmpty(secret) ? "" : "***")}]";
             }
         }
         

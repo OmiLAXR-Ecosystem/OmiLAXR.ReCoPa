@@ -90,6 +90,8 @@ namespace OmiLAXR.ReCoPa.Network
         private IJsonSerializer _serializer = new NewtonsoftJsonSerializer();
 
         private readonly object _gate = new();
+        // Serializes frame writes; heartbeat and caller threads may emit concurrently.
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
         private readonly Dictionary<string, List<Action<SocketResponse>>> _handlers = new(StringComparer.Ordinal);
 
         private TcpClient? _tcp;
@@ -217,14 +219,7 @@ namespace OmiLAXR.ReCoPa.Network
             // If connected, send immediately
             if (Connected && _stream != null)
             {
-                return Framing.WriteMessageAsync(
-                    _stream,
-                    eventName,
-                    payload,
-                    _opt.MaxMessageBytes,
-                    TimeSpan.FromMilliseconds(Math.Max(0, _opt.SendTimeoutMs)),
-                    _cts?.Token ?? CancellationToken.None
-                );
+                return WriteFrameAsync(eventName, payload, _cts?.Token ?? CancellationToken.None);
             }
 
             // If buffering is enabled, enqueue and return completed task
@@ -361,8 +356,9 @@ namespace OmiLAXR.ReCoPa.Network
                     // Enter blocking receive loop until disconnect.
                     await ReceiveLoopAsync(ct).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
+                    // Only a real cancellation ends the loop; receive/send timeouts reconnect below.
                     break;
                 }
                 catch (Exception ex)
@@ -465,36 +461,46 @@ namespace OmiLAXR.ReCoPa.Network
                 _outgoingQueue.Clear();
             }
 
-            foreach (var (ev, payload) in toSend)
+            for (var i = 0; i < toSend.Count; i++)
             {
                 if (ct.IsCancellationRequested) break;
+                var (ev, payload) = toSend[i];
                 try
                 {
-                    // Stream must exist after a successful connect.
-                    if (_stream == null) throw new InvalidOperationException("No stream while flushing queue.");
                     // Send buffered message with normal framing and timeouts.
-                    await Framing.WriteMessageAsync(
-                        _stream,
-                        ev,
-                        payload,
-                        _opt.MaxMessageBytes,
-                        TimeSpan.FromMilliseconds(Math.Max(0, _opt.SendTimeoutMs)),
-                        ct
-                    ).ConfigureAwait(false);
+                    await WriteFrameAsync(ev, payload, ct).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     UnityEngine.Debug.LogWarning($"[ReCoPa] Failed to send buffered event '{ev}': {ex.Message}");
-                    // If a send fails, re-enqueue remaining messages and abort flush
+                    // If a send fails, put the failed and all remaining messages back in their original order
                     lock (_gate)
                     {
-                        // Prepend remaining unsent messages back into queue
-                        var remaining = toSend.SkipWhile(t => !(t.EventName == ev && t.Payload == payload)).Skip(1).ToList();
-                        foreach (var r in remaining)
-                            _outgoingQueue.Insert(0, r);
+                        _outgoingQueue.InsertRange(0, toSend.Skip(i));
                     }
                     throw;
                 }
+            }
+        }
+
+        private async Task WriteFrameAsync(string eventName, string payload, CancellationToken ct)
+        {
+            await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var stream = _stream ?? throw new InvalidOperationException("No stream.");
+                await Framing.WriteMessageAsync(
+                    stream,
+                    eventName,
+                    payload,
+                    _opt.MaxMessageBytes,
+                    TimeSpan.FromMilliseconds(Math.Max(0, _opt.SendTimeoutMs)),
+                    ct
+                ).ConfigureAwait(false);
+            }
+            finally
+            {
+                _writeLock.Release();
             }
         }
 
@@ -660,8 +666,10 @@ namespace OmiLAXR.ReCoPa.Network
                     catch (Exception ex)
                     {
                         UnityEngine.Debug.LogError($"[ReCoPa] Heartbeat error: {ex.GetType().Name}: {ex.Message}");
-                        // Heartbeat-Fehler = Reconnect triggern
-                        throw;
+                        // Heartbeat-Fehler = Reconnect triggern: nobody observes this task, so closing the
+                        // socket is what makes the receive loop fail and the run loop reconnect.
+                        SafeClose();
+                        break;
                     }
                 }
             }
@@ -683,7 +691,8 @@ namespace OmiLAXR.ReCoPa.Network
             if (string.IsNullOrWhiteSpace(urlOrHostPort))
                 return ("127.0.0.1", defaultPort);
 
-            if (Uri.TryCreate(urlOrHostPort, UriKind.Absolute, out var uri))
+            // "localhost:4567" is a valid absolute URI with scheme "localhost" and no host, so require a host
+            if (Uri.TryCreate(urlOrHostPort, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.Host))
             {
                 var host = uri.Host;
                 var port = uri.IsDefaultPort ? defaultPort : uri.Port;
@@ -765,6 +774,8 @@ namespace OmiLAXR.ReCoPa.Network
             {
                 var offset = 0;
                 using var linked = CreateTimeoutCts(timeout, ct);
+                // NetworkStream.ReadAsync may ignore the token on some runtimes; closing the stream unblocks it.
+                using var registration = linked.Token.Register(stream.Close);
 
                 while (offset < buffer.Length)
                 {
